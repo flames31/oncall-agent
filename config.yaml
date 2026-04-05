@@ -1,0 +1,16 @@
+prometheus_url: "http://prometheus:9090"
+loki_url:       "http://loki:3100"
+
+groq_api_key: "${GROQ_API_KEY}"
+groq_model:   "llama-3.3-70b-versatile"
+
+slack_bot_token:  "${SLACK_BOT_TOKEN}"
+slack_channel:    "#incidents"
+pagerduty_secret: "${PAGERDUTY_SECRET}"
+
+postgres_dsn: "postgres://oncall:oncall@postgres:5432/oncall?sslmode=disable"
+
+worker_count:                  5
+dedup_window_seconds:          30
+max_llm_iterations:            8
+investigation_timeout_seconds: 45
