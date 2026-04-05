@@ -2,7 +2,7 @@ prometheus_url: "http://prometheus:9090"
 loki_url:       "http://loki:3100"
 
 groq_api_key: "${GROQ_API_KEY}"
-groq_model:   "llama-3.3-70b-versatile"
+groq_model:   "moonshotai/kimi-k2-instruct"
 
 slack_bot_token:  "${SLACK_BOT_TOKEN}"
 slack_channel:    "#incidents"

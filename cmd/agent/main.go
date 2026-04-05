@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
 	"net/http"
 	"os"
@@ -9,10 +10,13 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/lib/pq"
+
 	"github.com/flames31/oncall-agent/internal/config"
 	"github.com/flames31/oncall-agent/internal/investigation"
 	"github.com/flames31/oncall-agent/internal/llm"
 	"github.com/flames31/oncall-agent/internal/store"
+	"github.com/flames31/oncall-agent/internal/tools"
 	"github.com/flames31/oncall-agent/internal/webhook"
 )
 
@@ -21,17 +25,15 @@ func main() {
 		Level: slog.LevelInfo,
 	})))
 
+	// ── Config ────────────────────────────────────────────────────────────
 	cfg, err := config.Load("config.yaml")
 	if err != nil {
 		slog.Error("config load failed", "error", err)
 		os.Exit(1)
 	}
-	slog.Info("config loaded",
-		"model", cfg.GroqModel,
-		"worker_count", cfg.WorkerCount,
-		"dedup_window_seconds", cfg.DedupWindowSeconds,
-	)
+	slog.Info("config loaded", "model", cfg.GroqModel, "worker_count", cfg.WorkerCount)
 
+	// ── Database ──────────────────────────────────────────────────────────
 	db, err := store.New(cfg.PostgresDSN)
 	if err != nil {
 		slog.Error("db connect failed", "error", err)
@@ -46,6 +48,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ── Groq client ───────────────────────────────────────────────────────
 	groqClient := llm.NewClient(cfg.GroqAPIKey, cfg.GroqModel)
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer pingCancel()
@@ -55,22 +58,49 @@ func main() {
 	}
 	slog.Info("groq connected", "model", groqClient.Model())
 
-	// ── Webhook handler ───────────────────────────────────────────────────
+	// ── Tool clients ──────────────────────────────────────────────────────
+	toolSet := buildToolSet(cfg, db.DB)
+
+	// ── Investigator ──────────────────────────────────────────────────────
+	investigator := llm.NewInvestigator(groqClient, toolSet, cfg.MaxLLMIterations)
+
+	// ── Deduplicator ─────────────────────────────────────────────────────
 	dedup := investigation.NewDeduplicator(cfg.DedupWindowSeconds)
 
+	// ── Webhook handler ───────────────────────────────────────────────────
 	webhookHandler := webhook.NewHandler(
 		webhook.Config{
 			PagerDutySecret: cfg.PagerDutySecret,
-
-			// Phase 2 stub: just log the alert.
-			// Phase 6 replaces this with the worker pool dispatcher.
 			OnAlert: func(a webhook.Alert) {
-				slog.Info("alert queued for investigation",
-					"fingerprint", a.Fingerprint,
-					"service", a.ServiceName,
-					"alert", a.AlertName,
-					"severity", a.Severity,
-				)
+				// Run the investigation with a 45-second deadline.
+				// Slack delivery is wired in Phase 5 — for now we just log the result.
+				go func() {
+					ctx, cancel := context.WithTimeout(
+						context.Background(),
+						time.Duration(cfg.InvestigationTimeout)*time.Second,
+					)
+					defer cancel()
+
+					result, err := investigator.RunInvestigation(ctx, a)
+					if err != nil {
+						slog.Error("investigation failed",
+							"fingerprint", a.Fingerprint,
+							"error", err,
+						)
+						return
+					}
+
+					slog.Info("investigation result",
+						"fingerprint", a.Fingerprint,
+						"service", a.ServiceName,
+						"root_cause", result.RootCause,
+						"confidence", result.Confidence,
+						"iterations", result.IterationsUsed,
+						"tokens", result.TokensUsed,
+						"evidence_count", len(result.Evidence),
+						"actions_count", len(result.RecommendedActions),
+					)
+				}()
 			},
 		},
 		dedup,
@@ -83,13 +113,10 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
-
 	mux.Handle("POST /webhook", webhookHandler)
-
 	mux.HandleFunc("POST /slack/actions", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
@@ -120,4 +147,25 @@ func main() {
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutCancel()
 	srv.Shutdown(shutCtx)
+}
+
+// buildToolSet constructs all Phase 3 tool clients.
+// Kubernetes is optional — if no cluster is available it is set to nil
+// and the dispatcher returns a graceful "unavailable" message.
+func buildToolSet(cfg *config.Config, db *sql.DB) *llm.ToolSet {
+	var k8sClient *tools.KubernetesClient
+	k8s, err := tools.NewKubernetesClient()
+	if err != nil {
+		slog.Warn("kubernetes client unavailable — pod status tool disabled", "error", err)
+	} else {
+		k8sClient = k8s
+	}
+
+	return &llm.ToolSet{
+		Prometheus:  tools.NewPrometheusClient(cfg.PrometheusURL),
+		Loki:        tools.NewLokiClient(cfg.LokiURL),
+		Deployments: tools.NewDeploymentClient(db),
+		Kubernetes:  k8sClient,
+		Runbooks:    tools.NewRunbookClient(db),
+	}
 }
