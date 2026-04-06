@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/flames31/oncall-agent/internal/config"
 	"github.com/flames31/oncall-agent/internal/investigation"
 	"github.com/flames31/oncall-agent/internal/llm"
+	"github.com/flames31/oncall-agent/internal/report"
 	"github.com/flames31/oncall-agent/internal/store"
 	"github.com/flames31/oncall-agent/internal/tools"
 	"github.com/flames31/oncall-agent/internal/webhook"
@@ -31,7 +33,7 @@ func main() {
 		slog.Error("config load failed", "error", err)
 		os.Exit(1)
 	}
-	slog.Info("config loaded", "model", cfg.GroqModel, "worker_count", cfg.WorkerCount)
+	slog.Info("config loaded", "model", cfg.GroqModel, "channel", cfg.SlackChannel)
 
 	// ── Database ──────────────────────────────────────────────────────────
 	db, err := store.New(cfg.PostgresDSN)
@@ -48,7 +50,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── Groq client ───────────────────────────────────────────────────────
+	// ── Groq ──────────────────────────────────────────────────────────────
 	groqClient := llm.NewClient(cfg.GroqAPIKey, cfg.GroqModel)
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer pingCancel()
@@ -57,6 +59,9 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("groq connected", "model", groqClient.Model())
+
+	// ── Slack ─────────────────────────────────────────────────────────────
+	slackClient := report.NewSlackClient(cfg.SlackBotToken, cfg.SlackChannel)
 
 	// ── Tool clients ──────────────────────────────────────────────────────
 	toolSet := buildToolSet(cfg, db.DB)
@@ -72,15 +77,16 @@ func main() {
 		webhook.Config{
 			PagerDutySecret: cfg.PagerDutySecret,
 			OnAlert: func(a webhook.Alert) {
-				// Run the investigation with a 45-second deadline.
-				// Slack delivery is wired in Phase 5 — for now we just log the result.
 				go func() {
+					start := time.Now()
+
 					ctx, cancel := context.WithTimeout(
 						context.Background(),
 						time.Duration(cfg.InvestigationTimeout)*time.Second,
 					)
 					defer cancel()
 
+					// Run the investigation
 					result, err := investigator.RunInvestigation(ctx, a)
 					if err != nil {
 						slog.Error("investigation failed",
@@ -90,16 +96,39 @@ func main() {
 						return
 					}
 
-					slog.Info("investigation result",
+					// Format and post to Slack
+					r := report.Build(result, a, start)
+
+					postCtx, postCancel := context.WithTimeout(context.Background(), 15*time.Second)
+					defer postCancel()
+
+					ts, err := slackClient.PostReport(postCtx, r)
+					if err != nil {
+						slog.Error("slack post failed",
+							"fingerprint", a.Fingerprint,
+							"error", err,
+						)
+						return
+					}
+
+					slog.Info("report posted to slack",
 						"fingerprint", a.Fingerprint,
 						"service", a.ServiceName,
-						"root_cause", result.RootCause,
 						"confidence", result.Confidence,
-						"iterations", result.IterationsUsed,
-						"tokens", result.TokensUsed,
-						"evidence_count", len(result.Evidence),
-						"actions_count", len(result.RecommendedActions),
+						"ts", ts,
+						"duration_ms", time.Since(start).Milliseconds(),
 					)
+
+					// Store feedback record (correct = nil = not yet reviewed)
+					fbCtx, fbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer fbCancel()
+					if err := db.WriteFeedback(fbCtx, store.FeedbackEntry{
+						AlertFingerprint: a.Fingerprint,
+						ReportJSON:       result,
+						Correct:          nil,
+					}); err != nil {
+						slog.Warn("feedback write failed", "error", err)
+					}
 				}()
 			},
 		},
@@ -113,10 +142,55 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+
 	mux.Handle("POST /webhook", webhookHandler)
+
+	// Feedback handler — Slack button clicks
 	mux.HandleFunc("POST /slack/actions", func(w http.ResponseWriter, r *http.Request) {
+		// Acknowledge immediately — Slack requires a response within 3 seconds
 		w.WriteHeader(http.StatusOK)
+
+		actionID, fingerprint, err := report.ParseFeedback(r)
+		if err != nil {
+			slog.Warn("feedback parse failed", "error", err)
+			return
+		}
+
+		slog.Info("feedback received",
+			"action", actionID,
+			"fingerprint", fingerprint,
+		)
+
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			correct := actionID == "feedback_correct"
+			if err := db.WriteFeedback(ctx, store.FeedbackEntry{
+				AlertFingerprint: fingerprint,
+				ReportJSON:       map[string]string{"action": actionID},
+				Correct:          &correct,
+			}); err != nil {
+				slog.Error("feedback write failed", "error", err)
+				return
+			}
+
+			// On confirmation, upsert the root cause as a new runbook
+			// so future similar alerts benefit from this finding
+			if correct {
+				title := fmt.Sprintf("Confirmed: %s on %s", fingerprint, time.Now().Format("2006-01-02"))
+				content := fmt.Sprintf("Alert fingerprint: %s was confirmed correct by on-call engineer on %s.",
+					fingerprint, time.Now().UTC().Format(time.RFC3339))
+
+				if err := db.UpsertRunbook(ctx, title, content); err != nil {
+					slog.Warn("runbook upsert failed", "error", err)
+				} else {
+					slog.Info("runbook upserted from confirmed feedback", "fingerprint", fingerprint)
+				}
+			}
+		}()
 	})
+
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
@@ -149,14 +223,11 @@ func main() {
 	srv.Shutdown(shutCtx)
 }
 
-// buildToolSet constructs all Phase 3 tool clients.
-// Kubernetes is optional — if no cluster is available it is set to nil
-// and the dispatcher returns a graceful "unavailable" message.
 func buildToolSet(cfg *config.Config, db *sql.DB) *llm.ToolSet {
 	var k8sClient *tools.KubernetesClient
 	k8s, err := tools.NewKubernetesClient()
 	if err != nil {
-		slog.Warn("kubernetes client unavailable — pod status tool disabled", "error", err)
+		slog.Warn("kubernetes unavailable", "error", err)
 	} else {
 		k8sClient = k8s
 	}
