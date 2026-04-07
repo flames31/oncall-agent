@@ -12,6 +12,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/flames31/oncall-agent/internal/config"
 	"github.com/flames31/oncall-agent/internal/investigation"
@@ -33,7 +34,11 @@ func main() {
 		slog.Error("config load failed", "error", err)
 		os.Exit(1)
 	}
-	slog.Info("config loaded", "model", cfg.GroqModel, "channel", cfg.SlackChannel)
+	slog.Info("config loaded",
+		"model", cfg.GroqModel,
+		"workers", cfg.WorkerCount,
+		"channel", cfg.SlackChannel,
+	)
 
 	// ── Database ──────────────────────────────────────────────────────────
 	db, err := store.New(cfg.PostgresDSN)
@@ -60,80 +65,33 @@ func main() {
 	}
 	slog.Info("groq connected", "model", groqClient.Model())
 
-	// ── Slack ─────────────────────────────────────────────────────────────
-	slackClient := report.NewSlackClient(cfg.SlackBotToken, cfg.SlackChannel)
-
 	// ── Tool clients ──────────────────────────────────────────────────────
 	toolSet := buildToolSet(cfg, db.DB)
 
 	// ── Investigator ──────────────────────────────────────────────────────
 	investigator := llm.NewInvestigator(groqClient, toolSet, cfg.MaxLLMIterations)
 
-	// ── Deduplicator ─────────────────────────────────────────────────────
+	// ── Slack ─────────────────────────────────────────────────────────────
+	slackClient := report.NewSlackClient(cfg.SlackBotToken, cfg.SlackChannel)
+
+	// ── Worker pool ───────────────────────────────────────────────────────
+	pool := investigation.NewPool(cfg.WorkerCount, investigation.WorkerConfig{
+		Investigator:         investigator,
+		SlackClient:          slackClient,
+		DB:                   db,
+		InvestigationTimeout: time.Duration(cfg.InvestigationTimeout) * time.Second,
+	})
+	pool.Start()
+
+	// ── Orchestrator ──────────────────────────────────────────────────────
 	dedup := investigation.NewDeduplicator(cfg.DedupWindowSeconds)
+	orch := investigation.NewOrchestrator(dedup, pool)
 
 	// ── Webhook handler ───────────────────────────────────────────────────
-	webhookHandler := webhook.NewHandler(
-		webhook.Config{
-			PagerDutySecret: cfg.PagerDutySecret,
-			OnAlert: func(a webhook.Alert) {
-				go func() {
-					start := time.Now()
-
-					ctx, cancel := context.WithTimeout(
-						context.Background(),
-						time.Duration(cfg.InvestigationTimeout)*time.Second,
-					)
-					defer cancel()
-
-					// Run the investigation
-					result, err := investigator.RunInvestigation(ctx, a)
-					if err != nil {
-						slog.Error("investigation failed",
-							"fingerprint", a.Fingerprint,
-							"error", err,
-						)
-						return
-					}
-
-					// Format and post to Slack
-					r := report.Build(result, a, start)
-
-					postCtx, postCancel := context.WithTimeout(context.Background(), 15*time.Second)
-					defer postCancel()
-
-					ts, err := slackClient.PostReport(postCtx, r)
-					if err != nil {
-						slog.Error("slack post failed",
-							"fingerprint", a.Fingerprint,
-							"error", err,
-						)
-						return
-					}
-
-					slog.Info("report posted to slack",
-						"fingerprint", a.Fingerprint,
-						"service", a.ServiceName,
-						"confidence", result.Confidence,
-						"ts", ts,
-						"duration_ms", time.Since(start).Milliseconds(),
-					)
-
-					// Store feedback record (correct = nil = not yet reviewed)
-					fbCtx, fbCancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer fbCancel()
-					if err := db.WriteFeedback(fbCtx, store.FeedbackEntry{
-						AlertFingerprint: a.Fingerprint,
-						ReportJSON:       result,
-						Correct:          nil,
-					}); err != nil {
-						slog.Warn("feedback write failed", "error", err)
-					}
-				}()
-			},
-		},
-		dedup,
-	)
+	webhookHandler := webhook.NewHandler(webhook.Config{
+		PagerDutySecret: cfg.PagerDutySecret,
+		OnAlert:         orch.HandleAlert,
+	})
 
 	// ── HTTP server ───────────────────────────────────────────────────────
 	mux := http.NewServeMux()
@@ -145,9 +103,11 @@ func main() {
 
 	mux.Handle("POST /webhook", webhookHandler)
 
-	// Feedback handler — Slack button clicks
+	// Real Prometheus metrics endpoint
+	mux.Handle("GET /metrics", promhttp.Handler())
+
+	// Feedback handler
 	mux.HandleFunc("POST /slack/actions", func(w http.ResponseWriter, r *http.Request) {
-		// Acknowledge immediately — Slack requires a response within 3 seconds
 		w.WriteHeader(http.StatusOK)
 
 		actionID, fingerprint, err := report.ParseFeedback(r)
@@ -175,26 +135,20 @@ func main() {
 				return
 			}
 
-			// On confirmation, upsert the root cause as a new runbook
-			// so future similar alerts benefit from this finding
 			if correct {
-				title := fmt.Sprintf("Confirmed: %s on %s", fingerprint, time.Now().Format("2006-01-02"))
-				content := fmt.Sprintf("Alert fingerprint: %s was confirmed correct by on-call engineer on %s.",
-					fingerprint, time.Now().UTC().Format(time.RFC3339))
-
+				title := fmt.Sprintf("Confirmed: %s on %s",
+					fingerprint, time.Now().Format("2006-01-02"))
+				content := fmt.Sprintf(
+					"Alert fingerprint %s confirmed correct by on-call engineer on %s.",
+					fingerprint, time.Now().UTC().Format(time.RFC3339),
+				)
 				if err := db.UpsertRunbook(ctx, title, content); err != nil {
 					slog.Warn("runbook upsert failed", "error", err)
 				} else {
-					slog.Info("runbook upserted from confirmed feedback", "fingerprint", fingerprint)
+					slog.Info("runbook upserted", "fingerprint", fingerprint)
 				}
 			}
 		}()
-	})
-
-	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("# metrics endpoint — wired in Phase 6\n"))
 	})
 
 	srv := &http.Server{
@@ -218,15 +172,20 @@ func main() {
 
 	<-stop
 	slog.Info("shutting down")
+
+	// Graceful shutdown: stop accepting new requests, let workers finish
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutCancel()
 	srv.Shutdown(shutCtx)
+
+	// Close the jobs channel — workers drain and exit
+	pool.Stop()
+	slog.Info("shutdown complete")
 }
 
 func buildToolSet(cfg *config.Config, db *sql.DB) *llm.ToolSet {
 	var k8sClient *tools.KubernetesClient
-	k8s, err := tools.NewKubernetesClient()
-	if err != nil {
+	if k8s, err := tools.NewKubernetesClient(); err != nil {
 		slog.Warn("kubernetes unavailable", "error", err)
 	} else {
 		k8sClient = k8s
