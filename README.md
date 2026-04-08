@@ -19,16 +19,16 @@ The output is a Slack Block Kit message with a confidence badge (High / Medium /
 
 | Component | Technology |
 
-| Language | Go 1.22 |
-| LLM | Groq API — `moonshotai/kimi-k2-instruct` |
-| Webhook sources | Alertmanager, PagerDuty V3 |
-| Metrics | Prometheus HTTP API |
-| Logs | Loki (LogQL) |
-| Deployments | PostgreSQL |
-| Kubernetes | client-go |
-| Runbook search | PostgreSQL full-text search (tsvector + GIN index) |
-| Notifications | Slack Block Kit |
-| Agent metrics | Prometheus + Grafana |
+| Language | Go 1.22 |\
+| LLM | Groq API — `moonshotai/kimi-k2-instruct` |\
+| Webhook sources | Alertmanager, PagerDuty V3 |\
+| Metrics | Prometheus HTTP API |\
+| Logs | Loki (LogQL) |\
+| Deployments | PostgreSQL |\
+| Kubernetes | client-go |\
+| Runbook search | PostgreSQL full-text search (tsvector + GIN index) |\
+| Notifications | Slack Block Kit |\
+| Agent metrics | Prometheus + Grafana |\
 
 ## Quick start
 
@@ -62,20 +62,20 @@ Secrets are loaded from `.env` via `${VAR}` expansion in `config.yaml`. Notable 
 
 | Key | Default | Description |
 
-| `groq_model` | `moonshotai/kimi-k2-instruct` | Any Groq model with tool-use support |
-| `worker_count` | `5` | Parallel investigation workers |
-| `dedup_window_seconds` | `30` | Drops duplicate alerts within this window |
-| `max_llm_iterations` | `5` | Max tool calls per investigation |
-| `investigation_timeout_seconds` | `45` | Hard deadline per investigation |
+| `groq_model` | `moonshotai/kimi-k2-instruct` | Any Groq model with tool-use support |\
+| `worker_count` | `5` | Parallel investigation workers |\
+| `dedup_window_seconds` | `30` | Drops duplicate alerts within this window |\
+| `max_llm_iterations` | `5` | Max tool calls per investigation |\
+| `investigation_timeout_seconds` | `45` | Hard deadline per investigation |\
 
 ## Endpoints
 
 | Endpoint | Description |
 
-| `POST /webhook` | Alertmanager or PagerDuty V3 webhook |
-| `POST /slack/actions` | Slack button click payloads |
-| `GET /healthz` | Health check — returns `ok` |
-| `GET /metrics` | Prometheus metrics for the agent itself |
+| `POST /webhook` | Alertmanager or PagerDuty V3 webhook |\
+| `POST /slack/actions` | Slack button click payloads |\
+| `GET /healthz` | Health check — returns `ok` |\
+| `GET /metrics` | Prometheus metrics for the agent itself |\
 
 ## Project layout
 
