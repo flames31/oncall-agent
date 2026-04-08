@@ -22,6 +22,7 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-rules.yaml:/etc/prometheus/prometheus-rules.yaml:ro
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -31,9 +32,19 @@ services:
     image: grafana/loki:latest
     ports:
       - "3100:3100"
-    command: -config.file=/etc/loki/local-config.yaml
     volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
       - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+  promtail:
+    image: grafana/promtail:latest
+    volumes:
+      - ./promtail-config.yaml:/etc/promtail/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/config.yaml
+    depends_on:
+      - loki
 
   grafana:
     image: grafana/grafana:latest
@@ -45,6 +56,8 @@ services:
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboard.json:/var/lib/grafana/dashboards/oncall.json:ro
     depends_on:
       - prometheus
       - loki
@@ -55,6 +68,15 @@ services:
       - "9093:9093"
     volumes:
       - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+
+  demo-service:
+    build:
+      context: ..
+      dockerfile: cmd/demo-service/Dockerfile
+    ports:
+      - "9001:9001"
+    depends_on:
+      - prometheus
 
   agent:
     build:

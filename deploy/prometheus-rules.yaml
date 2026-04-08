@@ -1,0 +1,36 @@
+groups:
+  - name: demo-service-alerts
+    rules:
+
+      - alert: HighErrorRate
+        expr: |
+          (
+            rate(http_requests_total{service="demo-service",status="500"}[1m])
+            /
+            rate(http_requests_total{service="demo-service"}[1m])
+          ) * 100 > 5
+        for: 1m
+        labels:
+          severity: critical
+          service: demo-service
+        annotations:
+          description: >
+            Error rate on demo-service is {{ printf "%.1f" $value }}%,
+            which is above the 5% threshold.
+          summary: High error rate on demo-service
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(
+            0.99,
+            rate(http_request_duration_seconds_bucket{service="demo-service"}[5m])
+          ) * 1000 > 500
+        for: 2m
+        labels:
+          severity: warning
+          service: demo-service
+        annotations:
+          description: >
+            p99 latency on demo-service is
+            {{ printf "%.0f" $value }}ms, above the 500ms threshold.
+          summary: High p99 latency on demo-service
